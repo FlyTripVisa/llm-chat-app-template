@@ -1,130 +1,171 @@
-/**
- * chat.js — Fly Trip Chat client
- * Talks to /api/chat (Cloudflare Workers AI).
- *
- * Expected response JSON from the worker:
- *   { "reply": "AI text..." }
- *
- * You may also return { response: "..." } or { message: "..." }
- * — the client will pick whichever exists.
- */
-
-(function () {
+(() => {
   "use strict";
 
-  const chatMessages   = document.getElementById("chat-messages");
-  const userInput      = document.getElementById("user-input");
-  const sendButton     = document.getElementById("send-button");
-  const typingIndicator = document.getElementById("typing-indicator");
+  const messagesEl = document.getElementById("messages");
+  const presenceEl = document.getElementById("presence");
+  const formEl = document.getElementById("chatForm");
+  const inputEl = document.getElementById("input");
+  const sendBtn = document.getElementById("sendBtn");
+  const statusDot = document.getElementById("statusDot");
+  const statusText = document.getElementById("statusText");
 
-  let isWaiting = false;
+  /** @type {WebSocket | null} */
+  let ws = null;
+  let reconnectDelay = 1000;
+  const MAX_RECONNECT_DELAY = 15000;
 
-  /* ---------- helpers ---------- */
+  function setStatus(state, text) {
+    statusDot.className = "dot " + state;
+    statusText.textContent = text;
+  }
 
-  function scrollToBottom() {
-    chatMessages.scrollTo({
-      top: chatMessages.scrollHeight,
-      behavior: "smooth",
+  function formatTime(ts) {
+    return new Date(ts).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
     });
   }
 
-  function appendMessage(text, role) {
-    const div = document.createElement("div");
-    div.className = `message ${role}-message`;
+  function appendMessage(msg) {
+    const wrap = document.createElement("div");
 
-    const p = document.createElement("p");
-    p.textContent = text;
-    div.appendChild(p);
+    if (msg.type === "system") {
+      wrap.className = "msg system";
+      wrap.textContent = msg.text;
+    } else {
+      const isSelf = msg.username === currentUsername();
+      wrap.className = "msg" + (isSelf ? " self" : "");
 
-    chatMessages.appendChild(div);
-    scrollToBottom();
-    return div;
+      const meta = document.createElement("div");
+      meta.className = "meta";
+
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = isSelf ? "You" : msg.username;
+
+      const time = document.createElement("span");
+      time.textContent = formatTime(msg.timestamp);
+
+      meta.appendChild(name);
+      meta.appendChild(time);
+
+      const body = document.createElement("div");
+      body.textContent = msg.text;
+
+      wrap.appendChild(meta);
+      wrap.appendChild(body);
+    }
+
+    messagesEl.appendChild(wrap);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
-  function setTyping(visible) {
-    typingIndicator.classList.toggle("visible", visible);
-    typingIndicator.setAttribute("aria-hidden", visible ? "false" : "true");
+  function renderPresence(users) {
+    presenceEl.innerHTML = "";
+    if (!users || users.length === 0) return;
+
+    const label = document.createElement("span");
+    label.textContent = `Online (${users.length}):`;
+    presenceEl.appendChild(label);
+
+    for (const u of users) {
+      const chip = document.createElement("span");
+      chip.className = "user";
+      chip.textContent = u;
+      presenceEl.appendChild(chip);
+    }
   }
 
-  function setLoading(loading) {
-    isWaiting = loading;
-    userInput.disabled = loading;
-    sendButton.disabled = loading;
-    if (!loading) userInput.focus();
+  function clearMessages() {
+    messagesEl.innerHTML = "";
   }
 
-  function autoResizeTextarea() {
-    userInput.style.height = "auto";
-    const max = 140;
-    userInput.style.height = Math.min(userInput.scrollHeight, max) + "px";
+  function currentUsername() {
+    return sessionStorage.getItem("chat.username") || "";
   }
 
-  /* ---------- core send ---------- */
+  function promptForUsername() {
+    let name = prompt("Enter your username:", currentUsername() || "");
+    if (!name) name = "Guest" + Math.floor(Math.random() * 1000);
+    name = name.trim().slice(0, 32) || "Guest";
+    sessionStorage.setItem("chat.username", name);
+    return name;
+  }
 
-  async function sendMessage() {
-    const text = userInput.value.trim();
-    if (!text || isWaiting) return;
+  function connect() {
+    setStatus("connecting", "Connecting…");
+    inputEl.disabled = true;
+    sendBtn.disabled = true;
+    inputEl.placeholder = "Connecting…";
 
-    // 1. show the user's message
-    appendMessage(text, "user");
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${protocol}//${location.host}/api/chat`);
 
-    // 2. reset the input
-    userInput.value = "";
-    autoResizeTextarea();
+    ws.addEventListener("open", () => {
+      reconnectDelay = 1000;
+      setStatus("online", "Online");
+      inputEl.disabled = false;
+      sendBtn.disabled = false;
+      inputEl.placeholder = "Type a message…";
+      inputEl.focus();
 
-    // 3. show loading / typing
-    setLoading(true);
-    setTyping(true);
+      const username = promptForUsername();
+      ws.send(JSON.stringify({ type: "join", username }));
+    });
 
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
-      });
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    ws.addEventListener("message", (event) => {
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
       }
 
-      const data = await res.json();
-      const reply =
-        data.reply ?? data.response ?? data.message ?? "…";
+      switch (msg.type) {
+        case "history":
+          clearMessages();
+          for (const m of msg.messages) appendMessage(m);
+          break;
+        case "message":
+        case "system":
+          appendMessage(msg);
+          break;
+        case "presence":
+          renderPresence(msg.users);
+          break;
+      }
+    });
 
-      setTyping(false);
-      appendMessage(reply, "assistant");
-    } catch (err) {
-      console.error("[chat.js] AI request failed:", err);
-      setTyping(false);
-      appendMessage(
-        "⚠️ Sorry, I couldn't reach the AI service. Please try again.",
-        "assistant"
-      );
-    } finally {
-      setLoading(false);
-      setTyping(false);
-      scrollToBottom();
-    }
+    ws.addEventListener("close", () => {
+      setStatus("", "Disconnected");
+      inputEl.disabled = true;
+      sendBtn.disabled = true;
+      inputEl.placeholder = "Reconnecting…";
+      scheduleReconnect();
+    });
+
+    ws.addEventListener("error", () => {
+      try { ws && ws.close(); } catch {}
+    });
   }
 
-  /* ---------- events ---------- */
+  function scheduleReconnect() {
+    const delay = reconnectDelay;
+    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+    setStatus("connecting", `Reconnecting in ${Math.round(delay / 1000)}s…`);
+    setTimeout(connect, delay);
+  }
 
-  sendButton.addEventListener("click", sendMessage);
+  formEl.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = inputEl.value.trim();
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
 
-  userInput.addEventListener("keydown", (e) => {
-    // Enter alone = send, Shift+Enter = newline
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
+    ws.send(JSON.stringify({ type: "message", text }));
+    inputEl.value = "";
+    inputEl.focus();
   });
 
-  userInput.addEventListener("input", autoResizeTextarea);
-
-  window.addEventListener("load", () => {
-    userInput.focus();
-    scrollToBottom();
-  });
-
-  setTyping(false);
+  // Kick things off
+  connect();
 })();
